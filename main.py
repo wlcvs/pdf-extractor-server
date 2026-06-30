@@ -56,6 +56,7 @@ class Transaction(BaseModel):
 class ExtractResponse(BaseModel):
     bank: str
     transactions: list[Transaction]
+    extracted_text: str = ""
 
 
 @app.get("/health")
@@ -64,11 +65,15 @@ async def health():
 
 
 @app.post("/extract", response_model=ExtractResponse)
-async def extract(pdf: UploadFile = File(...), bank: str = Form("")):
+async def extract(pdf: UploadFile = File(...), bank: str = Form(""), corrections: str = Form("[]")):
     pdf_bytes = await pdf.read()
     detected_bank = bank or _detect_bank(pdf_bytes)
-    transactions = await _extract(pdf_bytes, detected_bank)
-    return ExtractResponse(bank=detected_bank, transactions=transactions)
+    try:
+        corrections_list = json.loads(corrections) if corrections else []
+    except (json.JSONDecodeError, ValueError):
+        corrections_list = []
+    transactions, extracted_text = await _extract(pdf_bytes, detected_bank, corrections_list)
+    return ExtractResponse(bank=detected_bank, transactions=transactions, extracted_text=extracted_text)
 
 
 # ── Bank detection ─────────────────────────────────────────────────────────────
@@ -98,29 +103,31 @@ def _plain_text(pdf_bytes: bytes) -> str:
 
 # ── Bank-specific extraction dispatch ─────────────────────────────────────────
 
-async def _extract(pdf_bytes: bytes, bank: str) -> list[Transaction]:
+async def _extract(pdf_bytes: bytes, bank: str, corrections: list[dict]) -> tuple[list[Transaction], str]:
     if bank == "Itaú":
-        return await _extract_itau(pdf_bytes)
+        return await _extract_itau(pdf_bytes, corrections)
     if bank == "Nubank":
-        return await _extract_nubank(pdf_bytes)
+        return await _extract_nubank(pdf_bytes, corrections)
     if bank == "Bradesco":
-        return await _extract_bradesco(pdf_bytes)
+        return await _extract_bradesco(pdf_bytes, corrections)
     if bank == "Mercado Pago":
-        return await _extract_mercadopago(pdf_bytes)
+        return await _extract_mercadopago(pdf_bytes, corrections)
     # Unknown: generic extraction
-    return await _call_llm(_plain_text(pdf_bytes), bank)
+    text = _plain_text(pdf_bytes)
+    txns = await _call_llm(text, bank, corrections=corrections)
+    return txns, text
 
 
 # ── Itaú ───────────────────────────────────────────────────────────────────────
 
-async def _extract_itau(pdf_bytes: bytes) -> list[Transaction]:
+async def _extract_itau(pdf_bytes: bytes, corrections: list[dict]) -> tuple[list[Transaction], str]:
     """
     Itaú fatura: extract only the transaction table rows (DATA | ESTABELECIMENTO | VALOR).
     The PDF has billing slips and installment simulations on other pages — skip those.
     """
     text = _itau_transaction_rows(pdf_bytes)
     if not text:
-        return []
+        return [], ""
     hint = (
         "\n\nItaú fatura transaction table (DATA | ESTABELECIMENTO | VALOR EM R$):\n"
         "- First line is the header: DATA  ESTABELECIMENTO  VALOREMR$\n"
@@ -129,7 +136,8 @@ async def _extract_itau(pdf_bytes: bytes) -> list[Transaction]:
         "- Combine code + continuation as description.\n"
         "- Skip: 'Lançamentosnocartão', 'LTotaldos', totals."
     )
-    return await _call_llm(text, "Itaú", extra_hint=hint, max_tokens=512)
+    txns = await _call_llm(text, "Itaú", extra_hint=hint, max_tokens=512, corrections=corrections)
+    return txns, text
 
 
 def _itau_transaction_rows(pdf_bytes: bytes) -> str:
@@ -177,14 +185,14 @@ def _itau_transaction_rows(pdf_bytes: bytes) -> str:
 
 # ── Nubank ─────────────────────────────────────────────────────────────────────
 
-async def _extract_nubank(pdf_bytes: bytes) -> list[Transaction]:
+async def _extract_nubank(pdf_bytes: bytes, corrections: list[dict]) -> tuple[list[Transaction], str]:
     plain = _plain_text(pdf_bytes)
     if "Movimentações" in plain:
-        return await _extract_nubank_extrato(pdf_bytes)
-    return await _extract_nubank_cartao(pdf_bytes)
+        return await _extract_nubank_extrato(pdf_bytes, corrections)
+    return await _extract_nubank_cartao(pdf_bytes, corrections)
 
 
-async def _extract_nubank_extrato(pdf_bytes: bytes) -> list[Transaction]:
+async def _extract_nubank_extrato(pdf_bytes: bytes, corrections: list[dict]) -> tuple[list[Transaction], str]:
     """
     Nubank extrato has many transactions spread across pages.
     Process page by page to keep each LLM call small and fast.
@@ -204,21 +212,23 @@ async def _extract_nubank_extrato(pdf_bytes: bytes) -> list[Transaction]:
 
     all_transactions: list[Transaction] = []
     seen: set[tuple] = set()
+    all_text_parts = []
 
     for page_text in pages_text:
         if not page_text.strip():
             continue
-        page_txns = await _call_llm(page_text, "Nubank", extra_hint=hint)
+        all_text_parts.append(page_text)
+        page_txns = await _call_llm(page_text, "Nubank", extra_hint=hint, corrections=corrections)
         for t in page_txns:
             key = (t.date, t.description, t.amount)
             if key not in seen:
                 seen.add(key)
                 all_transactions.append(t)
 
-    return all_transactions
+    return all_transactions, "\n\n---\n\n".join(all_text_parts)
 
 
-async def _extract_nubank_cartao(pdf_bytes: bytes) -> list[Transaction]:
+async def _extract_nubank_cartao(pdf_bytes: bytes, corrections: list[dict]) -> tuple[list[Transaction], str]:
     """
     Nubank credit card (fatura): transactions appear on pages labelled 'TRANSAÇÕES'.
     Process those pages individually to keep each LLM call small.
@@ -232,20 +242,22 @@ async def _extract_nubank_cartao(pdf_bytes: bytes) -> list[Transaction]:
     )
     all_transactions: list[Transaction] = []
     seen: set[tuple] = set()
+    all_text_parts = []
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
             if "TRANSAÇÕES" not in text:
                 continue
-            page_txns = await _call_llm(text, "Nubank", extra_hint=hint, max_tokens=2048)
+            all_text_parts.append(text)
+            page_txns = await _call_llm(text, "Nubank", extra_hint=hint, max_tokens=2048, corrections=corrections)
             for t in page_txns:
                 key = (t.date, t.description, t.amount)
                 if key not in seen:
                     seen.add(key)
                     all_transactions.append(t)
 
-    return all_transactions
+    return all_transactions, "\n\n---\n\n".join(all_text_parts)
 
 
 # ── Bradesco ───────────────────────────────────────────────────────────────────
@@ -273,11 +285,12 @@ Output ONLY a valid JSON array:
 Include ALL lines without exception."""
 
 
-async def _extract_bradesco(pdf_bytes: bytes) -> list[Transaction]:
+async def _extract_bradesco(pdf_bytes: bytes, corrections: list[dict]) -> tuple[list[Transaction], str]:
     text = _bradesco_clean_lines(pdf_bytes)
     if not text:
-        return []
-    return await _call_llm(text, "Bradesco", system_override=_BRADESCO_SYSTEM, max_tokens=2048)
+        return [], ""
+    txns = await _call_llm(text, "Bradesco", system_override=_BRADESCO_SYSTEM, max_tokens=2048, corrections=corrections)
+    return txns, text
 
 
 def _bradesco_clean_lines(pdf_bytes: bytes) -> str:
@@ -391,7 +404,7 @@ def _bradesco_clean_lines(pdf_bytes: bytes) -> str:
 
 # ── Mercado Pago ───────────────────────────────────────────────────────────────
 
-async def _extract_mercadopago(pdf_bytes: bytes) -> list[Transaction]:
+async def _extract_mercadopago(pdf_bytes: bytes, corrections: list[dict]) -> tuple[list[Transaction], str]:
     """Extract only the 'Detalhes de consumo' transaction section from Mercado Pago."""
     text = _mercadopago_transaction_section(pdf_bytes)
     hint = (
@@ -399,7 +412,8 @@ async def _extract_mercadopago(pdf_bytes: bytes) -> list[Transaction]:
         "'DD/MM  MERCHANT  R$ 111,23' or 'DD/MM  MERCHANT  Parcela 2 de 3  R$ 111,23'.\n"
         "Skip: 'Pagamento da fatura', 'Total R$' lines."
     )
-    return await _call_llm(text, "Mercado Pago", extra_hint=hint, max_tokens=512)
+    txns = await _call_llm(text, "Mercado Pago", extra_hint=hint, max_tokens=512, corrections=corrections)
+    return txns, text
 
 
 def _mercadopago_transaction_section(pdf_bytes: bytes) -> str:
@@ -443,9 +457,15 @@ Example: [{"date":"2026-05-11","description":"SUPERMERCADO ABC","amount":"89.90"
 
 async def _call_llm(
     text: str, bank: str, extra_hint: str = "", max_tokens: int = 2048,
-    system_override: str = "",
+    system_override: str = "", corrections: list[dict] | None = None,
 ) -> list[Transaction]:
     system = system_override if system_override else (_SYSTEM + extra_hint)
+    if corrections:
+        examples = "\n".join(
+            f"- {c['date']} {c['description']} {c['amount']}"
+            for c in corrections[:8]
+        )
+        system += f"\n\nPreviously missed transactions for {bank} that must always be included if they appear:\n{examples}"
     today = date.today().isoformat()
     response = await client.chat.completions.create(
         model=MODEL,
