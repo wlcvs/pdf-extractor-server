@@ -76,19 +76,33 @@ async def extract(req: ExtractRequest):
 
 
 _SYSTEM_PROMPT = """\
-You are a financial data extractor. You receive raw text from a Brazilian bank statement
-and must return a JSON array of all financial transactions you find.
+You are a financial data extractor. You receive raw text from a Brazilian bank statement.
+Your job is to find INDIVIDUAL PURCHASE/TRANSFER lines and return them as JSON.
 
-Rules:
-- Only include actual debits or charges (purchases, transfers, withdrawals, fees).
-- Do NOT include: totals, balances, credit payments ("Pagamento da fatura"), interest summaries, page numbers, or headers.
-- date: use YYYY-MM-DD format. If only day/month appear, infer the year from context.
-- description: merchant or transfer name, clean and concise. Include installment info if present (e.g. "Parcela 2/3").
-- amount: positive decimal string with 2 decimal places (e.g. "123.45"). Never negative.
+IMPORTANT: Ignore the summary section at the top (totals, "Total a pagar", "Você não tem gastos pendentes", limits).
+Look specifically at the transaction table — lines with a date, a description, and an amount.
+These are usually under headers like "Data Movimentações", "Detalhes de consumo", "Cartão Visa", "Cartão Mastercard", "DATA ESTABELECIMENTO".
 
-Respond with ONLY a valid JSON array. No markdown, no explanation, no extra text.
-Example: [{"date": "2025-03-15", "description": "SUPERMERCADO ABC", "amount": "89.90"}]
+INCLUDE: purchases (e.g. "SUPERMERCADO", "MP*MERCHANT"), PIX sent, TEDs sent, fees, loan installments.
+EXCLUDE: "Pagamento da fatura", credits received, "Pagamento recebido", totals, balance lines, interest summaries.
+
+Output format for each item:
+- date: YYYY-MM-DD. Infer year from statement header ("Emitida em", "Vencimento", "Data:").
+- description: clean merchant or counterpart name. Include "Parcela X/Y" if present.
+- amount: positive decimal string, 2 decimal places (e.g. "123.45" or "1234.56").
+
+Respond with ONLY a valid JSON array, no text before or after.
+Example: [{"date":"2025-03-15","description":"SUPERMERCADO ABC","amount":"89.90"},{"date":"2025-03-20","description":"PIX ENVIADO - João","amount":"50.00"}]
 """
+
+# Descriptions matching these patterns are incoming credits — drop them
+_CREDIT_PATTERNS = re.compile(
+    r"pagamento\s+da\s+fatura|pagamento\s+recebido|pagamento\s+efetuado|"
+    r"pix\s+recebido|ted\s+recebida?|transf\s+recebida?|"
+    r"estorno|devolu[cç][aã]o|reembolso|cr[eé]dito\s+em\s+conta|rendimento|"
+    r"saldo\s+anterior|saldo\s+final|total\s+da\s+fatura|total\s+a\s+pagar",
+    re.IGNORECASE,
+)
 
 
 async def _extract_with_llm(text: str, bank: str) -> list[Transaction]:
@@ -128,7 +142,7 @@ def _parse_response(raw: str) -> list[Transaction]:
         txn_date = _normalize_date(item.get("date", ""))
         description = str(item.get("description", "")).strip()
         amount = _normalize_amount(item.get("amount", ""))
-        if txn_date and description and amount:
+        if txn_date and description and amount and not _CREDIT_PATTERNS.search(description):
             result.append(Transaction(date=txn_date, description=description, amount=amount))
 
     return result
