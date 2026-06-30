@@ -220,27 +220,32 @@ async def _extract_nubank_extrato(pdf_bytes: bytes) -> list[Transaction]:
 
 async def _extract_nubank_cartao(pdf_bytes: bytes) -> list[Transaction]:
     """
-    Nubank credit card (fatura): transactions are in a table.
-    Extract table rows and feed clean text to the LLM.
+    Nubank credit card (fatura): transactions appear on pages labelled 'TRANSAÇÕES'.
+    Process those pages individually to keep each LLM call small.
     """
-    lines: list[str] = []
+    hint = (
+        "\n\nNubank credit card (fatura) format:\n"
+        "Each transaction line: 'DD MMM •••• NNNN  MERCHANT NAME  R$ 68,59'\n"
+        "Portuguese month → number: JAN=01 FEV=02 MAR=03 ABR=04 MAI=05 JUN=06 JUL=07 AGO=08 SET=09 OUT=10 NOV=11 DEZ=12\n"
+        "Year is 2026 (from the statement header).\n"
+        "Skip: lines starting with 'IOF de', lines with negative amounts (−R$), lines starting with 'Pagamento', totals."
+    )
+    all_transactions: list[Transaction] = []
+    seen: set[tuple] = set()
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            for table in page.extract_tables():
-                for row in table:
-                    if row and row[0]:
-                        cell = str(row[0]).split("\n")[0].strip()
-                        if cell:
-                            lines.append(cell)
+            text = page.extract_text() or ""
+            if "TRANSAÇÕES" not in text:
+                continue
+            page_txns = await _call_llm(text, "Nubank", extra_hint=hint, max_tokens=2048)
+            for t in page_txns:
+                key = (t.date, t.description, t.amount)
+                if key not in seen:
+                    seen.add(key)
+                    all_transactions.append(t)
 
-    text = "\n".join(lines)
-    hint = (
-        "\n\nNubank credit card (fatura) table format:\n"
-        "Each row: 'DD MMM •••• NNNN  MERCHANT NAME  R$ 68,59'\n"
-        "The date is 'DD MMM' (month abbreviated in Portuguese: JAN FEB MAR ABR MAI JUN JUL AGO SET OUT NOV DEZ).\n"
-        "Skip: 'IOF de', rows without a date prefix."
-    )
-    return await _call_llm(text, "Nubank", extra_hint=hint)
+    return all_transactions
 
 
 # ── Bradesco ───────────────────────────────────────────────────────────────────
@@ -253,25 +258,39 @@ _BR_AMOUNT = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
 _DATE_PREFIX = re.compile(r"^(\d{2}/\d{2}/(\d{4}))\s*")
 
 
+_BRADESCO_SYSTEM = """\
+Convert each input line to a JSON object. Every line is a confirmed debit transaction — do NOT skip, filter, or deduplicate any of them.
+
+Each line format: YYYY-MM-DD DESCRIPTION AMOUNT
+
+- date: copy exactly as YYYY-MM-DD
+- description: the text between the date and the last number on the line
+- amount: the last number on the line, already in decimal format (e.g. 186.69), copy as a string with 2 decimal places
+
+Output ONLY a valid JSON array:
+[{"date":"2026-05-11","description":"PIX ENVIADO","amount":"186.69"},...]
+
+Include ALL lines without exception."""
+
+
 async def _extract_bradesco(pdf_bytes: bytes) -> list[Transaction]:
     text = _bradesco_clean_lines(pdf_bytes)
     if not text:
         return []
-    hint = (
-        "\n\nEach input line is already a clean debit transaction:\n"
-        "YYYY-MM-DD DESCRIPTION R$AMOUNT\n"
-        "Just convert each line to JSON. Skip nothing — they are already filtered."
-    )
-    return await _call_llm(text, "Bradesco", extra_hint=hint, max_tokens=2048)
+    return await _call_llm(text, "Bradesco", system_override=_BRADESCO_SYSTEM, max_tokens=2048)
 
 
 def _bradesco_clean_lines(pdf_bytes: bytes) -> str:
     """
     Pre-process Bradesco extrato into unambiguous 'YYYY-MM-DD DESCRIPTION R$AMOUNT' lines.
 
-    Column structure: DocNum | Credit(R$) | Debit(R$) | Balance(R$)
-    Second-to-last amount = debit (what we want). Last amount = running balance (ignore).
-    Credit-only entries (incoming TED/PIX) are skipped via _BRADESCO_SKIP.
+    Entry structure (order in PDF):
+      [date] TYPE_LABEL        ← optional type label (may share line with date)
+      [date] DocNum D₁ D₂      ← amounts: second-to-last=debit, last=balance
+      DES:/REMET.: name DD/MM  ← recipient name (comes AFTER amounts)
+
+    We buffer each pending entry and only emit when the next entry starts, so we
+    can capture the DES: that follows the amounts line.
     """
     full_text = _plain_text(pdf_bytes)
     lines = full_text.splitlines()
@@ -291,45 +310,82 @@ def _bradesco_clean_lines(pdf_bytes: bytes) -> str:
 
     result = []
     current_date = None
-    current_type = None
-    current_desc = None
-    skip_next = False
+
+    p_date = None
+    p_type = None
+    p_desc = None
+    p_debit = None
+    p_skip = False
+    has_pending = False
+
+    def flush():
+        nonlocal has_pending, p_date, p_type, p_desc, p_debit, p_skip
+        if has_pending and not p_skip and p_debit and p_date:
+            val = float(p_debit.replace(".", "").replace(",", "."))
+            if val > 0:
+                d, m, y = p_date.split("/")
+                desc = p_desc or p_type or "DÉBITO"
+                result.append(f"{y}-{m}-{d} {desc} {val:.2f}")
+        has_pending = False
+        p_type = None
+        p_desc = None
+        p_debit = None
+        p_skip = False
 
     for line in section_lines:
         dm = _DATE_PREFIX.match(line)
         if dm:
-            current_date = dm.group(1)  # DD/MM/YYYY
+            current_date = dm.group(1)
             line = line[dm.end():].strip()
+
+        if not line:
+            continue
 
         amounts = _BR_AMOUNT.findall(line)
 
-        if line.startswith("DES:") or line.startswith("REMET."):
+        # Stop at totals line
+        if line.startswith("Total") and amounts:
+            flush()
+            continue
+
+        # Recipient name line — update pending description
+        if line.startswith("DES:") or line.startswith("REMET.") or line.startswith("REM:"):
             raw = line.split(":", 1)[-1] if ":" in line else line[5:]
-            current_desc = re.sub(r"\s+\d{2}/\d{2}$", "", raw).strip()
+            desc = re.sub(r"\s+\d{2}/\d{2}$", "", raw).strip()
+            if has_pending and p_desc is None:
+                p_desc = desc
             continue
 
+        # CONTR line (loan installment ref) — no desc update needed
         if line.startswith("CONTR") and not amounts:
-            if current_desc:
-                current_desc += " " + line
             continue
 
+        # Amounts line: DocNum + debit + balance
         if len(amounts) >= 2 and current_date:
-            if not skip_next:
-                debit_str = amounts[-2]
-                debit_val = float(debit_str.replace(".", "").replace(",", "."))
-                if debit_val > 0:
-                    desc = current_desc or current_type or "DÉBITO"
-                    d, m, y = current_date.split("/")
-                    result.append(f"{y}-{m}-{d} {desc} R${debit_str}")
-            current_type = None
-            current_desc = None
-            skip_next = False
+            if has_pending and p_debit is None:
+                # Fill debit for the current pending entry; date may have changed on this line
+                if _BRADESCO_SKIP.search(line):
+                    p_skip = True
+                p_debit = amounts[-2]
+                p_date = current_date
+            else:
+                # Standalone amounts (type was inline with date, or two rows back-to-back)
+                flush()
+                p_date = current_date
+                p_debit = amounts[-2]
+                p_skip = bool(_BRADESCO_SKIP.search(line))
+                has_pending = True
             continue
 
-        if re.match(r"^[A-Z][A-Z\s\-\.\*]+$", line) and not amounts:
-            current_type = line
-            skip_next = bool(_BRADESCO_SKIP.search(line))
+        # Type label line — start new pending entry
+        if re.match(r"^[A-Z\*][A-Z\s\-\.\*\/]+$", line) and not amounts:
+            flush()
+            p_date = current_date
+            p_type = line
+            p_skip = bool(_BRADESCO_SKIP.search(line))
+            has_pending = True
 
+    flush()
     return "\n".join(result)
 
 
@@ -386,9 +442,10 @@ Example: [{"date":"2026-05-11","description":"SUPERMERCADO ABC","amount":"89.90"
 
 
 async def _call_llm(
-    text: str, bank: str, extra_hint: str = "", max_tokens: int = 2048
+    text: str, bank: str, extra_hint: str = "", max_tokens: int = 2048,
+    system_override: str = "",
 ) -> list[Transaction]:
-    system = _SYSTEM + extra_hint
+    system = system_override if system_override else (_SYSTEM + extra_hint)
     today = date.today().isoformat()
     response = await client.chat.completions.create(
         model=MODEL,
