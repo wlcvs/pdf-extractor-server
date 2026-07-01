@@ -47,13 +47,19 @@ ollama pull qwen2.5:3b
 
 ## Architecture
 
-All logic is in `main.py`:
+```
+config.py     # env vars, Ollama client (client, MODEL, OLLAMA_BASE_URL, PORT, HOST)
+main.py       # FastAPI app: /health, /extract — no extraction logic
+banks/
+  __init__.py     # detect_bank(pdf_bytes), extract(pdf_bytes, bank, corrections) dispatch
+  base.py         # Transaction model, call_llm(), parse_response()/norm_date()/norm_amount(), extract_generic() fallback
+  itau.py         # Itaú extractor + prompt hint
+  nubank.py       # Nubank extractor (cartão + extrato) + prompt hints
+  bradesco.py     # Bradesco extractor + system prompt
+  mercadopago.py  # Mercado Pago extractor + prompt hint
+```
 
-- **`_detect_bank(pdf_bytes)`** — keyword-based bank detection from plain text
-- **`_extract(pdf_bytes, bank, corrections)`** — dispatches to bank-specific extractor
-- **Bank extractors** (`_extract_itau`, `_extract_nubank`, `_extract_bradesco`, `_extract_mercadopago`) — each pre-processes the PDF into clean text before calling the LLM
-- **`_call_llm(text, bank, ...)`** — sends text + system prompt to Ollama, returns `list[Transaction]`
-- **`_parse(raw)`** — extracts JSON array from LLM response, normalizes dates/amounts, filters out credits/payments
+Each bank module is self-contained: its PDF pre-processing, its prompt (as a module-level constant), and a single `async def extract(pdf_bytes, corrections) -> (transactions, extracted_text)`. **Adding a new bank = adding a new module to `banks/`** and wiring it into the `if/elif` dispatch in `banks/__init__.py:extract()` — nothing else changes.
 
 ## `corrections` parameter
 

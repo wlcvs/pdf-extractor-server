@@ -64,10 +64,16 @@ OLLAMA_BASE_URL=http://localhost:11434/v1 LLM_MODEL=qwen2.5:3b PORT=8001 python 
 
 ## Architecture
 
-All logic lives in `main.py`:
+```
+config.py     # env vars, Ollama client
+main.py       # FastAPI app: /health, /extract
+banks/
+  __init__.py     # detect_bank(pdf_bytes), extract(pdf_bytes, bank, corrections) dispatch
+  base.py         # Transaction model, call_llm(), response parsing, generic fallback extractor
+  itau.py         # Itaú extractor + prompt
+  nubank.py       # Nubank extractor (cartão + extrato) + prompts
+  bradesco.py     # Bradesco extractor + prompt
+  mercadopago.py  # Mercado Pago extractor + prompt
+```
 
-- `_detect_bank(pdf_bytes)` — keyword-based bank detection from plain text
-- `_extract(pdf_bytes, bank, corrections)` — dispatches to a bank-specific extractor
-- Bank extractors (`_extract_itau`, `_extract_nubank`, `_extract_bradesco`, `_extract_mercadopago`) — each pre-processes the PDF into clean text before calling the LLM
-- `_call_llm(text, bank, ...)` — sends text + system prompt to Ollama, returns `list[Transaction]`
-- `_parse(raw)` — extracts the JSON array from the LLM response, normalizes dates/amounts, filters out credits/payments
+Each bank module owns its extraction strategy (PDF pre-processing) and its prompt hint, and exposes a single `async def extract(pdf_bytes, corrections) -> (transactions, extracted_text)`. Adding a new bank means adding a new module to `banks/` and wiring it into the dispatcher in `banks/__init__.py` — no changes needed elsewhere.
