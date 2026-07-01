@@ -1,5 +1,5 @@
 """
-PDF Extractor Server
+bank-statement-extractor
 
 Receives a PDF file and returns structured transactions using a local LLM (Ollama).
 Each bank gets its own text extraction strategy to give the LLM clean, readable input.
@@ -34,11 +34,11 @@ client = AsyncOpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(f"pdf-extractor-server — model: {MODEL}, ollama: {OLLAMA_BASE_URL}")
+    print(f"bank-statement-extractor — model: {MODEL}, ollama: {OLLAMA_BASE_URL}")
     yield
 
 
-app = FastAPI(title="pdf-extractor-server", lifespan=lifespan)
+app = FastAPI(title="bank-statement-extractor", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
